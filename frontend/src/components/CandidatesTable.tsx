@@ -1,5 +1,4 @@
 import { useNavigate } from "react-router-dom";
-import { fetchCandidatesList, type CandidateResponse } from "../services/candidatesService";
 
 type Candidate = { name: string; phone: string; email: string; profile: string; score: number };
 type Props = { data?: Candidate[]; rawData?: unknown };
@@ -29,12 +28,12 @@ export default function CandidatesTable({ data, rawData }: Props) {
           </tr>
         </thead>
         <tbody>
-          {candidates.map((c, i) => {
+          {candidates.map((c, index) => {
             const isGood = c.score >= 60;
             return (
               <tr
-                key={i}
-                onClick={() => navigate(`/candidate/${c.email}`, { state: rawData })}
+                key={`${c.email}-${index}`}
+                onClick={() => navigate(`/candidate/${index}`, { state: rawData })}
                 style={{ cursor: "pointer", borderBottom: "1px solid var(--border)", transition: "background .15s" }}
                 onMouseEnter={e => (e.currentTarget.style.background = "#f8f9fb")}
                 onMouseLeave={e => (e.currentTarget.style.background = "transparent")}
@@ -67,6 +66,3 @@ export default function CandidatesTable({ data, rawData }: Props) {
 
 const th: React.CSSProperties = { padding: "14px 16px", fontSize: 14, fontWeight: 600, textAlign: "right" };
 const td: React.CSSProperties = { padding: "14px 16px", fontSize: 14 };
-
-// Re-export for HRDashboard
-export { fetchCandidatesList, type CandidateResponse };

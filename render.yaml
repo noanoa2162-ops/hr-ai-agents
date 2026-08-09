@@ -15,3 +15,9 @@ services:
         sync: false
       - key: N8N_WEBHOOK_URL
         sync: false
+      - key: ANALYSIS_ACCESS_KEY
+        sync: false
+      - key: CANDIDATES_ADMIN_KEY
+        sync: false
+      - key: STORE_CANDIDATES
+        value: "false"

@@ -1,326 +1,336 @@
-import sys
-import io
-sys.stdout = io.TextIOWrapper(sys.stdout.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-sys.stderr = io.TextIOWrapper(sys.stderr.buffer, encoding='utf-8', errors='replace', line_buffering=True)
-
-import json
 import asyncio
-import traceback
-import uvicorn
-import httpx
-from fastapi import FastAPI, HTTPException, Form, UploadFile, File, Request
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import FileResponse
-from typing import Optional, List
+import logging
 import os
+import smtplib
+from collections import deque
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from pathlib import Path
+from typing import Annotated
+
+import httpx
+import uvicorn
 from dotenv import load_dotenv
-
-load_dotenv()
-
-# Email config
-EMAIL_FROM = os.getenv("EMAIL_FROM", "")  # e.g. yourapp@gmail.com
-EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")  # Gmail App Password
-EMAIL_TO = os.getenv("EMAIL_TO", "")  # HR manager email
-
-from models import CandidateInput
-from agents_services import (
-    search_candidate_info,
-    prepare_analysis_prompt,
-    call_gemini_analyzer,
-    analyze_audio_file,
-    load_criteria_from_csv,
-    RecruitmentAgent,
+from fastapi import (
+    BackgroundTasks,
+    Depends,
+    FastAPI,
+    File,
+    Form,
+    HTTPException,
+    UploadFile,
+    status,
 )
-from validator import OutputValidator
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
+from pydantic import ValidationError
+
+
+BASE_DIR = Path(__file__).resolve().parent
+STATIC_DIR = BASE_DIR / "static"
+load_dotenv(BASE_DIR / ".env")
+
+from agents_services import (  # noqa: E402
+    RecruitmentAgent,
+    analyze_audio_file,
+    call_gemini_analyzer,
+    load_criteria_from_csv,
+    prepare_analysis_prompt,
+    search_candidate_info,
+)
+from models import CandidateInput, CandidateRequest  # noqa: E402
+from security import require_analysis_access, require_candidates_admin  # noqa: E402
+from validator import OutputValidator  # noqa: E402
+
+
+logger = logging.getLogger(__name__)
+
+EMAIL_FROM = os.getenv("EMAIL_FROM", "")
+EMAIL_PASSWORD = os.getenv("EMAIL_PASSWORD", "")
+EMAIL_TO = os.getenv("EMAIL_TO", "")
+N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
+STORE_CANDIDATES = os.getenv("STORE_CANDIDATES", "false").lower() == "true"
+MAX_AUDIO_BYTES = 10 * 1024 * 1024
+ALLOWED_AUDIO_TYPES = {
+    "audio/mpeg",
+    "audio/mp4",
+    "audio/ogg",
+    "audio/wav",
+    "audio/webm",
+    "audio/x-m4a",
+    "audio/x-wav",
+}
+ALLOWED_ORIGINS = [
+    origin.strip().rstrip("/")
+    for origin in os.getenv("ALLOWED_ORIGINS", "http://localhost:5173").split(",")
+    if origin.strip()
+]
 
 app = FastAPI(title="Unified HR Recruitment API - Hackathon")
-
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_origins=ALLOWED_ORIGINS,
+    allow_methods=["GET", "POST"],
+    allow_headers=["Content-Type", "X-Analysis-Key", "X-Admin-Key"],
 )
+app.mount("/assets", StaticFiles(directory=STATIC_DIR / "assets"), name="assets")
 
-# N8N webhook URL - set in .env
-N8N_WEBHOOK_URL = os.getenv("N8N_WEBHOOK_URL", "")
-
-# In-memory store of all analyzed candidates (for /candidates endpoint)
-candidates_store: List[dict] = []
-
-# Serve static frontend files
-app.mount("/assets", StaticFiles(directory="static/assets"), name="assets")
-
-# Initialize agents lazily
+candidates_store: deque[dict] = deque(maxlen=100)
 psychologist_agent = None
 output_validator = OutputValidator()
 
 
-def get_psychologist_agent():
+def get_psychologist_agent() -> RecruitmentAgent:
     global psychologist_agent
     if psychologist_agent is None:
         psychologist_agent = RecruitmentAgent()
     return psychologist_agent
 
 
+def get_criteria() -> list[str]:
+    criteria = load_criteria_from_csv(str(BASE_DIR / "requirements.csv"))
+    return criteria or ["ניסיון רלוונטי", "יכולת טכנית", "התאמה תרבותית"]
+
+
+def validate_candidate_form(
+    first_name: str,
+    last_name: str,
+    email: str,
+    phone: str,
+) -> CandidateRequest:
+    try:
+        return CandidateRequest(
+            first_name=first_name,
+            last_name=last_name,
+            email=email,
+            phone=phone,
+        )
+    except ValidationError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail=exc.errors(include_input=False),
+        ) from exc
+
+
+async def finalize_analysis(
+    candidate: CandidateRequest,
+    social_profile: dict,
+    interaction_profile: dict,
+    background_tasks: BackgroundTasks,
+) -> dict:
+    full_name = f"{candidate.first_name} {candidate.last_name}"
+    formatted_candidate = CandidateInput(
+        social_profile=social_profile,
+        interaction_profile=interaction_profile,
+    )
+    final_result = await get_psychologist_agent().run(formatted_candidate)
+
+    if "dashboard_view" in final_result:
+        final_result["dashboard_view"]["email"] = candidate.email
+        final_result["dashboard_view"]["phone"] = candidate.phone
+
+    validation_errors = output_validator.validate(final_result)
+    response_data = {
+        "success": True,
+        "candidate_name": full_name,
+        "email": candidate.email,
+        "phone": candidate.phone,
+        "analysis": final_result,
+        "validation_warnings": validation_errors,
+    }
+
+    if STORE_CANDIDATES:
+        candidates_store.append(response_data)
+
+    if N8N_WEBHOOK_URL:
+        await send_to_n8n(final_result)
+
+    background_tasks.add_task(send_email_notification, response_data)
+    return response_data
+
+
 @app.get("/")
-def serve_frontend():
-    return FileResponse("static/index.html")
+def serve_frontend() -> FileResponse:
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 @app.get("/health")
-def health_check():
+def health_check() -> dict[str, str]:
     return {"status": "up and running", "system": "Unified Hackathon API v1.0"}
 
 
-# ===================================================================
-# GET /candidates - Returns all analyzed candidates (for Racheli's dashboard)
-# ===================================================================
-@app.get("/candidates")
-def get_candidates():
-    return candidates_store
+@app.get("/candidates", dependencies=[Depends(require_candidates_admin)])
+def get_candidates() -> list[dict]:
+    return list(candidates_store)
 
 
-# ===================================================================
-# POST /analyze - JSON endpoint (for Racheli's React frontend - NO audio)
-# ===================================================================
-@app.post("/analyze")
-async def analyze_json(request: Request):
-    """Endpoint for Racheli's React frontend - accepts JSON, no audio file"""
+@app.post("/analyze", dependencies=[Depends(require_analysis_access)])
+async def analyze_json(
+    candidate: CandidateRequest,
+    background_tasks: BackgroundTasks,
+) -> dict:
     try:
-        body = await request.json()
-        first_name = body.get("first_name", "")
-        last_name = body.get("last_name", "")
-        email = body.get("email", "")
-        phone = body.get("phone", "")
-        full_name = f"{first_name} {last_name}"
-
-        print(f"\n🚀 --- [JSON] מתחיל תהליך עבור: {full_name} ---")
-
-        # Only run Agent 1 (web search) + Agent 3 (psychologist) - no audio
-        criteria = load_criteria_from_csv("requirements.csv")
-        if not criteria:
-            criteria = ["ניסיון רלוונטי", "יכולת טכנית", "התאמה תרבותית"]
-
-        web_data = await search_candidate_info(first_name, last_name, email)
-        analysis_prompt = prepare_analysis_prompt(full_name, web_data, criteria)
-        social_profile_result = await call_gemini_analyzer(analysis_prompt)
-
-        print("✅ סוכן 1 סיים")
-
-        # Agent 3 - psychologist (with empty audio profile)
-        empty_audio = {
+        full_name = f"{candidate.first_name} {candidate.last_name}"
+        web_data = await search_candidate_info(
+            candidate.first_name,
+            candidate.last_name,
+            candidate.email,
+        )
+        analysis_prompt = prepare_analysis_prompt(full_name, web_data, get_criteria())
+        social_profile = await call_gemini_analyzer(analysis_prompt)
+        interaction_profile = {
             "status": "skipped",
             "candidate": full_name,
-            "analysis_result": {"summary": "לא סופק קובץ אודיו", "match_percentage": 0}
+            "analysis_result": {
+                "summary": "לא סופק קובץ אודיו",
+                "match_percentage": 0,
+            },
         }
 
-        formatted_candidate = CandidateInput(
-            social_profile=social_profile_result,
-            interaction_profile=empty_audio,
+        return await finalize_analysis(
+            candidate,
+            social_profile,
+            interaction_profile,
+            background_tasks,
         )
-
-        final_result = await get_psychologist_agent().run(formatted_candidate)
-
-        # Inject email+phone into result
-        if "dashboard_view" in final_result:
-            final_result["dashboard_view"]["email"] = email
-            final_result["dashboard_view"]["phone"] = phone
-
-        validation_errors = output_validator.validate(final_result)
-
-        response_data = {
-            "success": True,
-            "candidate_name": full_name,
-            "email": email,
-            "phone": phone,
-            "analysis": final_result,
-            "validation_warnings": validation_errors,
-        }
-
-        # Store for /candidates endpoint
-        candidates_store.append(response_data)
-
-        # Send notifications
-        if N8N_WEBHOOK_URL:
-            print("\n🚀 שולח נתונים ל-n8n...")
-            await _send_to_n8n(final_result)
-        _send_email_notification(response_data)
-
-        print(f"[JSON] completed for {full_name}")
-        return response_data
-
-    except Exception as e:
-        print(f"❌ שגיאה: {str(e)}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Candidate analysis failed.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Candidate analysis could not be completed.",
+        ) from exc
 
 
-@app.post("/analyze_complete")
+@app.post("/analyze_complete", dependencies=[Depends(require_analysis_access)])
 async def analyze_complete_candidate(
-    first_name: str = Form(...),
-    last_name: str = Form(...),
-    email: Optional[str] = Form(None),
-    phone: Optional[str] = Form(None),
+    background_tasks: BackgroundTasks,
+    first_name: Annotated[str, Form()],
+    last_name: Annotated[str, Form()],
+    email: Annotated[str, Form()] = "",
+    phone: Annotated[str, Form()] = "",
     audio_file: UploadFile = File(...),
-):
+) -> dict:
     try:
-        full_name = f"{first_name} {last_name}"
-        print(f"\n🚀 --- מתחיל תהליך מלא עבור: {full_name} ---")
+        candidate = validate_candidate_form(first_name, last_name, email, phone)
 
-        # ==========================================================
-        # שלב 1+2: סוכן חיפוש + סוכן אודיו - רצים במקביל!
-        # ==========================================================
-        print("🔍🎤 מפעיל סוכן רשת + סוכן אודיו במקביל...")
+        if audio_file.content_type not in ALLOWED_AUDIO_TYPES:
+            raise HTTPException(
+                status_code=status.HTTP_415_UNSUPPORTED_MEDIA_TYPE,
+                detail="Upload a supported audio file.",
+            )
 
-        criteria = load_criteria_from_csv("requirements.csv")
-        if not criteria:
-            criteria = ["ניסיון רלוונטי", "יכולת טכנית", "התאמה תרבותית"]
+        file_content = await audio_file.read(MAX_AUDIO_BYTES + 1)
+        if len(file_content) > MAX_AUDIO_BYTES:
+            raise HTTPException(
+                status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE,
+                detail="Audio files are limited to 10 MB.",
+            )
 
-        file_content = await audio_file.read()
+        full_name = f"{candidate.first_name} {candidate.last_name}"
+        criteria = get_criteria()
 
-        # Run both agents at the same time!
-        async def run_agent1():
-            web_data = await search_candidate_info(first_name, last_name, email)
-            analysis_prompt = prepare_analysis_prompt(full_name, web_data, criteria)
-            return await call_gemini_analyzer(analysis_prompt)
+        async def run_web_agent():
+            web_data = await search_candidate_info(
+                candidate.first_name,
+                candidate.last_name,
+                candidate.email,
+            )
+            prompt = prepare_analysis_prompt(full_name, web_data, criteria)
+            return await call_gemini_analyzer(prompt)
 
-        async def run_agent2():
-            return await analyze_audio_file(file_content, audio_file.filename, full_name)
+        async def run_audio_agent():
+            return await analyze_audio_file(
+                file_content,
+                audio_file.filename or "audio-upload",
+                full_name,
+            )
 
-        social_profile_result, audio_profile_result = await asyncio.gather(
-            run_agent1(), run_agent2()
+        social_profile, interaction_profile = await asyncio.gather(
+            run_web_agent(),
+            run_audio_agent(),
         )
 
-        print("✅ סוכן 1 סיים - פרופיל סושיאל:")
-        print(json.dumps(social_profile_result, indent=2, ensure_ascii=False))
-        print("✅ סוכן 2 סיים - פרופיל אודיו:")
-        print(json.dumps(audio_profile_result, indent=2, ensure_ascii=False))
+        return await finalize_analysis(
+            candidate,
+            social_profile,
+            interaction_profile,
+            background_tasks,
+        )
+    except HTTPException:
+        raise
+    except Exception as exc:
+        logger.exception("Complete candidate analysis failed.")
+        raise HTTPException(
+            status_code=status.HTTP_502_BAD_GATEWAY,
+            detail="Candidate analysis could not be completed.",
+        ) from exc
+    finally:
+        await audio_file.close()
 
-        # ==========================================================
-        # שלב 3: הפסיכולוג (Gemini) מאחד את הכל
-        # ==========================================================
-        print("🧠 מפעיל את הפסיכולוג המסכם (Gemini)...")
 
-        formatted_candidate = CandidateInput(
-            social_profile=social_profile_result,
-            interaction_profile=audio_profile_result,
+async def send_to_n8n(data: dict) -> None:
+    try:
+        async with httpx.AsyncClient(timeout=15) as client:
+            response = await client.post(N8N_WEBHOOK_URL, json=data)
+            response.raise_for_status()
+    except Exception:
+        logger.exception("Unable to deliver the analysis webhook.")
+
+
+def send_email_notification(data: dict) -> None:
+    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
+        return
+
+    try:
+        analysis = data.get("analysis", {})
+        dashboard = analysis.get("dashboard_view", {})
+        details = analysis.get("interview_details", {})
+
+        name = dashboard.get("full_name", data.get("candidate_name", ""))
+        score = dashboard.get("match_percent", 0)
+        candidate_status = dashboard.get("status", "")
+        strengths = "\n".join(f"  - {item}" for item in details.get("strengths", []))
+        weaknesses = "\n".join(f"  - {item}" for item in details.get("weaker_points", []))
+        reasons = "\n".join(f"  - {item}" for item in details.get("score_reasons", []))
+
+        body = (
+            "שלום,\n\n"
+            "התקבלה תוצאת ניתוח עבור מועמד חדש:\n\n"
+            f"שם: {name}\n"
+            f"אימייל: {data.get('email', '')}\n"
+            f"טלפון: {data.get('phone', '')}\n"
+            f"ציון התאמה: {score}/10 ({int(score * 10)}%)\n"
+            f"סטטוס: {candidate_status}\n\n"
+            f"נקודות חוזק:\n{strengths}\n\n"
+            f"נקודות לשיפור:\n{weaknesses}\n\n"
+            f"נימוקי ציון:\n{reasons}\n"
         )
 
-        final_result = await get_psychologist_agent().run(formatted_candidate)
+        message = MIMEMultipart()
+        message["From"] = EMAIL_FROM
+        message["To"] = EMAIL_TO
+        message["Subject"] = (
+            f"מועמד חדש: {name} - ציון {int(score * 10)}% - {candidate_status}"
+        )
+        message.attach(MIMEText(body, "plain", "utf-8"))
 
-        # Inject email+phone into result so N8N and frontend can use them
-        if "dashboard_view" in final_result:
-            final_result["dashboard_view"]["email"] = email or ""
-            final_result["dashboard_view"]["phone"] = phone or ""
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=15) as server:
+            server.login(EMAIL_FROM, EMAIL_PASSWORD)
+            server.send_message(message)
+    except Exception:
+        logger.exception("Unable to send the candidate notification email.")
 
-        # Validate output
-        validation_errors = output_validator.validate(final_result)
-        if validation_errors:
-            print(f"⚠️ שגיאות ולידציה: {validation_errors}")
 
-        print("\n✅ תהליך הושלם בהצלחה!")
-        print(json.dumps(final_result, indent=2, ensure_ascii=False))
-
-        response_data = {
-            "success": True,
-            "candidate_name": full_name,
-            "email": email or "",
-            "phone": phone or "",
-            "analysis": final_result,
-            "validation_warnings": validation_errors,
-        }
-
-        # Send notifications
-        if N8N_WEBHOOK_URL:
-            print("\n🚀 שולח נתונים ל-n8n...")
-            await _send_to_n8n(final_result)
-        _send_email_notification(response_data)
-
-        # Store for /candidates endpoint
-        candidates_store.append(response_data)
-
-        return response_data
-
-    except Exception as e:
-        print(f"❌ שגיאה בתהליך העיבוד הראשי: {str(e)}")
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+@app.get("/{full_path:path}")
+async def spa_catchall(full_path: str) -> FileResponse:
+    requested_file = (STATIC_DIR / full_path).resolve()
+    if requested_file.is_relative_to(STATIC_DIR) and requested_file.is_file():
+        return FileResponse(requested_file)
+    return FileResponse(STATIC_DIR / "index.html")
 
 
 if __name__ == "__main__":
     uvicorn.run(app, host="0.0.0.0", port=8080)
-
-
-async def _send_to_n8n(data: dict):
-    """Send analysis result to N8N webhook for candidate notifications"""
-    try:
-        async with httpx.AsyncClient(timeout=15) as client:
-            resp = await client.post(N8N_WEBHOOK_URL, json=data)
-            if resp.status_code == 200:
-                print(f"✅ הנתונים נשלחו ל-n8n בהצלחה! המייל בדרך. status={resp.status_code}")
-            else:
-                print(f"⚠️ שגיאה בשליחה ל-n8n. סטטוס: {resp.status_code}, body: {resp.text}")
-    except Exception as e:
-        print(f"❌ שגיאת תקשורת מול n8n: {e}")
-
-
-def _send_email_notification(data: dict):
-    """Send email notification to HR manager about new candidate analysis"""
-    if not EMAIL_FROM or not EMAIL_PASSWORD or not EMAIL_TO:
-        print("Email not configured - skipping notification")
-        return
-    try:
-        import smtplib
-        from email.mime.text import MIMEText
-        from email.mime.multipart import MIMEMultipart
-
-        analysis = data.get("analysis", {})
-        dv = analysis.get("dashboard_view", {})
-        details = analysis.get("interview_details", {})
-
-        name = dv.get("full_name", data.get("candidate_name", ""))
-        score = dv.get("match_percent", 0)
-        status = dv.get("status", "")
-        strengths = "\n".join(f"  - {s}" for s in details.get("strengths", []))
-        weaknesses = "\n".join(f"  - {w}" for w in details.get("weaker_points", []))
-        reasons = "\n".join(f"  - {r}" for r in details.get("score_reasons", []))
-
-        body = (
-            f"שלום,\n\n"
-            f"התקבלה תוצאת ניתוח עבור מועמד חדש:\n\n"
-            f"שם: {name}\n"
-            f"אימייל: {data.get('email', '')}\n"
-            f"טלפון: {data.get('phone', '')}\n"
-            f"ציון התאמה: {score}/10 ({int(score*10)}%)\n"
-            f"סטטוס: {status}\n\n"
-            f"נקודות חוזק:\n{strengths}\n\n"
-            f"נקודות לשיפור:\n{weaknesses}\n\n"
-            f"נימוקי ציון:\n{reasons}\n\n"
-            f"---\nמערכת סינון מועמדים - ביטוח ישיר"
-        )
-
-        msg = MIMEMultipart()
-        msg["From"] = EMAIL_FROM
-        msg["To"] = EMAIL_TO
-        msg["Subject"] = f"מועמד חדש: {name} - ציון {int(score*10)}% - {status}"
-        msg.attach(MIMEText(body, "plain", "utf-8"))
-
-        with smtplib.SMTP_SSL("smtp.gmail.com", 465) as server:
-            server.login(EMAIL_FROM, EMAIL_PASSWORD)
-            server.send_message(msg)
-        print(f"Email sent to {EMAIL_TO} about {name}")
-    except Exception as e:
-        print(f"Email failed (non-blocking): {e}")
-
-
-# SPA catch-all: any route not matching API endpoints serves index.html
-@app.get("/{full_path:path}")
-async def spa_catchall(full_path: str):
-    # Serve actual static files if they exist
-    import os
-    static_file = os.path.join("static", full_path)
-    if os.path.isfile(static_file):
-        return FileResponse(static_file)
-    return FileResponse("static/index.html")

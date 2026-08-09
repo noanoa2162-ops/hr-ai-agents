@@ -1,10 +1,30 @@
-from pydantic import BaseModel
+from pydantic import BaseModel, Field, field_validator
 from typing import Any, Dict, List, Optional
 
 
 class CandidateInput(BaseModel):
     social_profile: Dict[str, Any]
     interaction_profile: Dict[str, Any]
+
+
+class CandidateRequest(BaseModel):
+    first_name: str = Field(max_length=80)
+    last_name: str = Field(max_length=80)
+    email: str = Field(default="", max_length=254)
+    phone: str = Field(default="", max_length=30)
+
+    @field_validator("first_name", "last_name")
+    @classmethod
+    def require_non_empty_name(cls, value: str) -> str:
+        normalized = value.strip()
+        if not normalized:
+            raise ValueError("Name fields cannot be empty.")
+        return normalized
+
+    @field_validator("email", "phone")
+    @classmethod
+    def normalize_optional_fields(cls, value: str) -> str:
+        return value.strip()
 
 
 class DashboardView(BaseModel):

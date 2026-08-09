@@ -68,7 +68,7 @@ export default function CandidateDetails() {
             <BarChart data={traits} margin={{ bottom: 60 }}>
               <XAxis dataKey="name" tick={{ fontSize: 12, angle: -35, textAnchor: 'end' }} interval={0} />
               <YAxis domain={[0, 100]} tick={{ fontSize: 12 }} />
-              <Tooltip formatter={(v: number) => `${v}%`} />
+              <Tooltip formatter={(value) => `${Number(value ?? 0)}%`} />
               <Bar dataKey="value" radius={[4, 4, 0, 0]} barSize={32}>
                 {traits.map((t, i) => (
                   <Cell key={i} fill={t.value >= 60 ? "#3b82f6" : t.value >= 40 ? "#94a3b8" : "#e2e8f0"} />

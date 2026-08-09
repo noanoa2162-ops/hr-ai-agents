@@ -4,14 +4,21 @@ import { fetchCandidatesList, type CandidateResponse } from "../services/candida
 
 export default function HRDashboard() {
   const [candidates, setCandidates] = useState<CandidateResponse[]>([]);
-  const [loading, setLoading] = useState(true);
+  const [adminKey, setAdminKey] = useState(
+    () => sessionStorage.getItem("candidatesAdminKey") || "",
+  );
+  const [draftKey, setDraftKey] = useState(adminKey);
+  const [loading, setLoading] = useState(Boolean(adminKey));
   const [error, setError] = useState("");
 
   useEffect(() => {
+    if (!adminKey) return;
+
     const load = async () => {
       try {
-        const data = await fetchCandidatesList();
+        const data = await fetchCandidatesList(adminKey);
         setCandidates(data);
+        setError("");
       } catch (err) {
         setError(err instanceof Error ? err.message : "שגיאה");
       } finally {
@@ -21,7 +28,36 @@ export default function HRDashboard() {
     load();
     const interval = setInterval(load, 30000);
     return () => clearInterval(interval);
-  }, []);
+  }, [adminKey]);
+
+  if (!adminKey) {
+    return (
+      <div style={{ minHeight: "100vh", display: "grid", placeItems: "center", background: "var(--bg)" }}>
+        <form
+          onSubmit={(event) => {
+            event.preventDefault();
+            const normalizedKey = draftKey.trim();
+            if (!normalizedKey) return;
+            sessionStorage.setItem("candidatesAdminKey", normalizedKey);
+            setLoading(true);
+            setAdminKey(normalizedKey);
+          }}
+          style={{ width: 340, padding: 28, borderRadius: 12, background: "var(--card)", boxShadow: "var(--shadow-sm)" }}
+        >
+          <h1 style={{ fontSize: 22, marginTop: 0 }}>גישת מנהל</h1>
+          <p style={{ color: "var(--text-secondary)", fontSize: 14 }}>יש להזין קוד מנהל כדי לצפות בפרטי מועמדים.</p>
+          <input
+            type="password"
+            value={draftKey}
+            onChange={(event) => setDraftKey(event.target.value)}
+            autoComplete="off"
+            style={{ width: "100%", boxSizing: "border-box", padding: 10, marginBottom: 12 }}
+          />
+          <button type="submit" style={{ width: "100%", padding: 10, cursor: "pointer" }}>כניסה</button>
+        </form>
+      </div>
+    );
+  }
 
   const tableData = candidates.map((c) => ({
     name: c.analysis.dashboard_view.full_name,
@@ -42,6 +78,16 @@ export default function HRDashboard() {
           <span style={{ fontSize: 14, color: "var(--text-secondary)" }}>
             {candidates.length} מועמדים
           </span>
+          <button
+            onClick={() => {
+              sessionStorage.removeItem("candidatesAdminKey");
+              setAdminKey("");
+              setDraftKey("");
+              setCandidates([]);
+            }}
+          >
+            יציאה
+          </button>
         </div>
 
         {loading && (

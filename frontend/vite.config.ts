@@ -6,6 +6,10 @@ const API_URL = process.env.VITE_API_URL || 'http://localhost:8080'
 
 export default defineConfig({
   plugins: [react()],
+  build: {
+    outDir: "../static",
+    emptyOutDir: true,
+  },
   server: {
     proxy: {
       '/analyze': {

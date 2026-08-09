@@ -27,6 +27,9 @@ export default function FirstMassage({ onAnalysisComplete }: Props) {
     phone: "",
   });
   const [audioFile, setAudioFile] = useState<File | null>(null);
+  const [accessKey, setAccessKey] = useState(
+    () => sessionStorage.getItem("analysisAccessKey") || "",
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   const [errors, setErrors] = useState<Partial<FormData>>({});
   const [errorMessage, setErrorMessage] = useState("");
@@ -53,12 +56,14 @@ export default function FirstMassage({ onAnalysisComplete }: Props) {
     setStep("loading");
     setErrorMessage("");
     try {
+      if (accessKey) sessionStorage.setItem("analysisAccessKey", accessKey);
       const result = await sendAnalysisData({
         first_name: form.first_name,
         last_name: form.last_name,
         email: form.email,
         phone: form.phone,
         audio_file: audioFile || undefined,
+        access_key: accessKey,
       });
       if (result.success && result.analysis) {
         onAnalysisComplete(result.analysis);
@@ -141,6 +146,15 @@ export default function FirstMassage({ onAnalysisComplete }: Props) {
           fullWidth label="טלפון (אופציונלי)" variant="outlined"
           value={form.phone}
           onChange={(e) => handleChange("phone", e.target.value)}
+          sx={{ ...fieldSx, mb: 2 }}
+        />
+
+        <TextField
+          fullWidth label="קוד גישה לדמו (אם נדרש)" variant="outlined"
+          type="password"
+          value={accessKey}
+          onChange={(e) => setAccessKey(e.target.value)}
+          autoComplete="off"
           sx={{ ...fieldSx, mb: 2 }}
         />
 

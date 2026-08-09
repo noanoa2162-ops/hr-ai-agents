@@ -11,11 +11,19 @@ wheels/
 
 # Environment variables
 .env
-.env.example
+.env.local
+.env.*.local
+!.env.example
 
 # Logs
 server_out.log
 server_err.log
+*.log
+
+# Tests and coverage
+.pytest_cache/
+.coverage
+htmlcov/
 
 # Node
 frontend/node_modules/

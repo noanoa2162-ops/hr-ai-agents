@@ -1,7 +1,7 @@
 [project]
 name = "all-agants"
 version = "0.1.0"
-description = "Add your description here"
+description = "Privacy-conscious multi-agent recruiting assistant"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [

@@ -36,11 +36,14 @@ export type CandidateResponse = {
   };
 };
 
-export const fetchCandidatesList = async (): Promise<CandidateResponse[]> => {
+export const fetchCandidatesList = async (
+  adminKey: string,
+): Promise<CandidateResponse[]> => {
   const response = await fetch("/candidates", {
     method: "GET",
     headers: {
       "Content-Type": "application/json",
+      "X-Admin-Key": adminKey,
     },
   });
 
